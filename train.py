@@ -1,113 +1,111 @@
 import os
+import argparse
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# 作成した自作モジュールをインポート
+# 自作モジュールのインポート
 from model import HybridSegmentationNet, HybridLoss
 from dataset import SegmentationDataset
 
-def train_model(image_dir, mask_dir, num_epochs=5, batch_size=4, learning_rate=1e-4, device='cpu'):
-    # 1. データセットとデータローダーの準備
-    dataset = SegmentationDataset(image_dir=image_dir, mask_dir=mask_dir, image_size=(256, 256))
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+def train_one_epoch(model, dataloader, criterion, optimizer, device):
+    """1エポック分の学習を実行"""
+    model.train()
+    total_loss, total_seg, total_sparse = 0, 0, 0
     
-    print(f"データセットサイズ: {len(dataset)}枚")
-    print(f"使用デバイス: {device}")
-
-    # 2. モデル、損失関数、最適化手法の定義
-    model = HybridSegmentationNet().to(device)
-    criterion = HybridLoss(lambda_sparse=0.1)
-    
-    # AdamWオプティマイザ (重み減衰を利用して過学習を防ぐ)
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-
-    # 3. 学習ループ
-    for epoch in range(num_epochs):
-        model.train() # 学習モードに設定
-        epoch_loss = 0.0
-        epoch_l_seg = 0.0
-        epoch_l_sparse = 0.0
+    pbar = tqdm(dataloader, desc="  Train", leave=False)
+    for images, masks in pbar:
+        images, masks = images.to(device), masks.to(device)
         
-        # tqdmでプログレスバーを表示
-        with tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}") as pbar:
-            for images, masks in pbar:
-                # データをGPU/CPUへ転送
-                images = images.to(device)
-                masks = masks.to(device)
-                
-                # 勾配の初期化
-                optimizer.zero_grad()
-                
-                # 順伝播 (Forward)
-                pred_mask, gate_values = model(images)
-                
-                # 損失計算 (Loss)
-                loss, l_seg, l_sparse = criterion(pred_mask, masks, gate_values)
-                
-                # 逆伝播 (Backward)
-                loss.backward()
-                
-                # パラメータ更新 (Optimizer step)
-                optimizer.step()
-                
-                # ログの記録
-                epoch_loss += loss.item()
-                epoch_l_seg += l_seg.item()
-                epoch_l_sparse += l_sparse.item()
-                
-                # プログレスバーの表示更新
-                pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
-                
-        # エポックごとの平均Lossを出力
-        avg_loss = epoch_loss / len(dataloader)
-        avg_l_seg = epoch_l_seg / len(dataloader)
-        avg_l_sparse = epoch_l_sparse / len(dataloader)
-        print(f"Epoch [{epoch+1}/{num_epochs}] Average Loss: {avg_loss:.4f} (Seg: {avg_l_seg:.4f}, Sparse: {avg_l_sparse:.4f})")
+        optimizer.zero_grad()
+        pred_mask, gate_values = model(images)
+        loss, l_seg, l_sparse = criterion(pred_mask, masks, gate_values)
         
-    # 4. 学習済みモデルの保存
-    os.makedirs("weights", exist_ok=True)
-    save_path = "weights/hybrid_seg_net_latest.pth"
-    torch.save(model.state_dict(), save_path)
-    print(f"モデルの重みを保存しました: {save_path}")
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        total_seg += l_seg.item()
+        total_sparse += l_sparse.item()
+        pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+        
+    return total_loss / len(dataloader), total_seg / len(dataloader), total_sparse / len(dataloader)
 
-# ==========================================
-# テスト実行ブロック (ダミーデータを用いた学習ループの動作確認)
-# ==========================================
-if __name__ == "__main__":
-    import numpy as np
-    import shutil
-    from PIL import Image
+def validate(model, dataloader, criterion, device):
+    """検証データでの評価を実行"""
+    model.eval()
+    total_loss, total_seg, total_sparse = 0, 0, 0
     
-    # GPUが使える場合はGPUを、そうでない場合はCPUを使用
+    with torch.no_grad():
+        pbar = tqdm(dataloader, desc="  Val  ", leave=False)
+        for images, masks in pbar:
+            images, masks = images.to(device), masks.to(device)
+            pred_mask, gate_values = model(images)
+            loss, l_seg, l_sparse = criterion(pred_mask, masks, gate_values)
+            
+            total_loss += loss.item()
+            total_seg += l_seg.item()
+            total_sparse += l_sparse.item()
+            
+    return total_loss / len(dataloader), total_seg / len(dataloader), total_sparse / len(dataloader)
+
+def main(args):
+    # デバイス設定
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # ダミーディレクトリと画像の生成
-    test_img_dir = "./dummy_train_images"
-    test_mask_dir = "./dummy_train_masks"
-    os.makedirs(test_img_dir, exist_ok=True)
-    os.makedirs(test_mask_dir, exist_ok=True)
-    
-    print("学習ループテスト用のダミーデータを生成中...")
-    for i in range(8): # 8枚のダミー画像を生成 (Batch=4なら1エポックあたり2イテレーション)
-        img_array = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
-        Image.fromarray(img_array).save(os.path.join(test_img_dir, f"image_{i:03d}.png"))
-        
-        mask_array = np.random.randint(0, 2, (256, 256), dtype=np.uint8) * 255
-        Image.fromarray(mask_array).save(os.path.join(test_mask_dir, f"image_{i:03d}.png"))
+    os.makedirs(args.save_dir, exist_ok=True)
 
-    # 学習ループの実行 (テストのため2エポックのみ)
-    train_model(
-        image_dir=test_img_dir, 
-        mask_dir=test_mask_dir, 
-        num_epochs=2, 
-        batch_size=4, 
-        learning_rate=1e-4, 
-        device=device
+    # 1. データセットとローダー
+    train_ds = SegmentationDataset(
+        os.path.join(args.data_root, "train/images"),
+        os.path.join(args.data_root, "train/masks")
+    )
+    val_ds = SegmentationDataset(
+        os.path.join(args.data_root, "val/images"),
+        os.path.join(args.data_root, "val/masks")
     )
     
-    # 後片付け
-    shutil.rmtree(test_img_dir)
-    shutil.rmtree(test_mask_dir)
-    print("\n--- 学習パイプラインのテスト完了 ---")
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
+
+    # 2. モデル・損失関数・最適化
+    model = HybridSegmentationNet(alpha=args.alpha).to(device)
+    criterion = HybridLoss(lambda_sparse=args.lambda_sparse)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    print(f"Starting Training on {device}...")
+    print(f"Train: {len(train_ds)} samples, Val: {len(val_ds)} samples")
+
+    best_val_loss = float('inf')
+
+    # 3. 学習メインループ
+    for epoch in range(args.epochs):
+        print(f"\nEpoch {epoch+1}/{args.epochs}")
+        
+        train_loss, train_seg, train_sparse = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_seg, val_sparse = validate(model, val_loader, criterion, device)
+        
+        print(f"  [Train] Loss: {train_loss:.4f} (Seg: {train_seg:.4f}, Sparse: {train_sparse:.4f})")
+        print(f"  [Val]   Loss: {val_loss:.4f} (Seg: {val_seg:.4f}, Sparse: {val_sparse:.4f})")
+
+        # 4. モデルの保存（Best Model更新時）
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_path = os.path.join(args.save_dir, "best_model.pth")
+            torch.save(model.state_dict(), save_path)
+            print(f"  >>> Best model saved! (Val Loss: {best_val_loss:.4f})")
+
+    print("\nTraining Completed.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="HybridSegNet Training Pipeline")
+    parser.add_argument("--data_root", type=str, default="./dataset", help="Dataset root directory")
+    parser.add_argument("--save_dir", type=str, default="./weights", help="Directory to save weights")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--alpha", type=float, default=0.1, help="Alpha value for gate")
+    parser.add_argument("--lambda_sparse", type=float, default=0.1, help="Sparsity penalty weight")
+    
+    args = parser.parse_args()
+    main(args)
