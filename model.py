@@ -15,59 +15,41 @@ class SimpleDeformableAttention(nn.Module):
         self.num_points = num_points
         self.head_dim = embed_dim // num_heads
 
-        # オフセット予測: 各クエリに対して、num_heads * num_points 個の2次元オフセット(Δx, Δy)を予測
         self.offset_proj = nn.Linear(embed_dim, num_heads * num_points * 2)
-        
-        # アテンション重み予測: サンプリングポイントに対する重要度を予測
         self.weight_proj = nn.Linear(embed_dim, num_heads * num_points)
-        
-        # Valueの線形変換と最終出力の線形変換
         self.value_proj = nn.Linear(embed_dim, embed_dim)
         self.output_proj = nn.Linear(embed_dim, embed_dim)
 
     def forward(self, x, h, w):
         B, N, C = x.shape
 
-        # 1. 基準点 (Reference Points) の生成: [0, 1] の範囲で正規化
         grid_y, grid_x = torch.meshgrid(
             torch.linspace(0, 1, h, device=x.device),
             torch.linspace(0, 1, w, device=x.device),
             indexing='ij'
         )
         ref_points = torch.stack([grid_x, grid_y], dim=-1).reshape(N, 2)
-        ref_points = ref_points.unsqueeze(0).unsqueeze(2).unsqueeze(3) # (1, N, 1, 1, 2)
+        ref_points = ref_points.unsqueeze(0).unsqueeze(2).unsqueeze(3)
 
-        # 2. オフセットとアテンション重みの計算
-        # view の代わりに reshape を使用してメモリ配置エラーを回避
         offsets = self.offset_proj(x).reshape(B, N, self.num_heads, self.num_points, 2)
         weights = self.weight_proj(x).reshape(B, N, self.num_heads, self.num_points)
-        weights = F.softmax(weights, dim=-1) # サンプリングポイント間で正規化
+        weights = F.softmax(weights, dim=-1)
 
-        # サンプリング座標 = 基準点 + オフセット (grid_sampleの仕様に合わせて[-1, 1]にスケール変換)
         sample_coords = ref_points + offsets
         sample_coords = sample_coords * 2.0 - 1.0 
 
-        # 3. Valueの空間サンプリング
         v = self.value_proj(x)
         v_spatial = rearrange(v, 'b (h w) c -> b c h w', h=h, w=w)
-        
-        # reshape を使用して安全に次元変換 (B * num_heads, head_dim, h, w)
         v_spatial = v_spatial.reshape(B * self.num_heads, self.head_dim, h, w)
         
-        # 座標テンソルもヘッドごとに分割
         sample_coords_grouped = sample_coords.permute(0, 2, 1, 3, 4).reshape(B * self.num_heads, N, self.num_points, 2)
 
-        # F.grid_sampleによる微分可能なバイリニア補間サンプリング
         sampled_v = F.grid_sample(v_spatial, sample_coords_grouped, mode='bilinear', align_corners=False)
-        
-        # 元の次元構造に復元
         sampled_v = sampled_v.reshape(B, self.num_heads, self.head_dim, N, self.num_points)
 
-        # 4. アテンション重みによる集約
         weights = weights.permute(0, 2, 1, 3).unsqueeze(2)
         weighted_v = torch.sum(sampled_v * weights, dim=-1)
 
-        # 元の系列テンソルに復元
         out = rearrange(weighted_v, 'b head d n -> b n (head d)')
         out = self.output_proj(out)
 
@@ -153,9 +135,10 @@ class HybridSegmentationNet(nn.Module):
             nn.Linear(embed_dim, 1)
         )
 
+        # 変更点: pretrained=True によりImageNetの事前学習済み重みをロード
         self.encoder = timm.create_model(
             'mobilenetv3_large_100', 
-            pretrained=False, 
+            pretrained=True, 
             in_chans=embed_dim, 
             features_only=True
         )
@@ -187,13 +170,32 @@ class HybridSegmentationNet(nn.Module):
 # 提案手法専用のカスタム損失関数
 # ==========================================
 class HybridLoss(nn.Module):
-    def __init__(self, lambda_sparse=0.1):
+    def __init__(self, lambda_sparse=0.1, lambda_dice=1.0):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss()
         self.lambda_sparse = lambda_sparse
+        self.lambda_dice = lambda_dice # 追加: Dice Lossの重み係数
 
     def forward(self, pred_mask, true_mask, gate_values):
-        l_seg = self.bce(pred_mask, true_mask)
+        # 1. BCE Loss
+        l_bce = self.bce(pred_mask, true_mask)
+        
+        # 2. Dice Lossの計算（追加）
+        pred_sigmoid = torch.sigmoid(pred_mask)
+        # 空間次元 (H, W) に対して交差と和を計算
+        intersection = (pred_sigmoid * true_mask).sum(dim=(2, 3))
+        union = pred_sigmoid.sum(dim=(2, 3)) + true_mask.sum(dim=(2, 3))
+        # スムージング項 (1e-5) を加え、ゼロ除算を防止
+        dice_score = (2. * intersection + 1e-5) / (union + 1e-5)
+        l_dice = 1.0 - dice_score.mean()
+
+        # 3. セグメンテーション全体の損失
+        l_seg = l_bce + self.lambda_dice * l_dice
+        
+        # 4. スパース性ペナルティ
         l_sparse = torch.mean(gate_values)
+        
+        # 総合損失
         total_loss = l_seg + (self.lambda_sparse * l_sparse)
+        
         return total_loss, l_seg, l_sparse
