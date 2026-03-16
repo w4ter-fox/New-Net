@@ -23,8 +23,8 @@ class SegmentationDataset(Dataset):
                 A.RandomRotate90(p=0.5),
                 # 細長い構造の向きやスケール変化に対応
                 A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=45, p=0.5),
-                # 有機的・不規則な曲がり具合をシミュレート
-                A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.2),
+                # 有機的・不規則な曲がり具合をシミュレート (警告の出た alpha_affine を削除)
+                A.ElasticTransform(alpha=1, sigma=50, p=0.2),
                 # 画像の正規化 (ImageNet基準)
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2(),
@@ -44,19 +44,24 @@ class SegmentationDataset(Dataset):
         img_path = os.path.join(self.image_dir, self.images[idx])
         mask_path = os.path.join(self.mask_dir, self.masks[idx])
 
-        # 画像の読み込み
+        # 画像の読み込み (RGB)
         image = np.array(Image.open(img_path).convert("RGB"))
         
-        # マスクの読み込み（グレースケール）
-        # 値が[0, 1]であることを前提とし、そのままの数値を維持
-        mask = np.array(Image.open(mask_path).convert("L"), dtype=np.float32)
+        # マスクの読み込み (L)
+        mask_raw = Image.open(mask_path).convert("L")
+        mask_np = np.array(mask_raw)
+
+        # 【客観的修正】 0より大きい値（1や255）をすべて 1.0 に、それ以外を 0.0 に変換
+        # これにより IoU が 1.0 を超える計算ミスを防ぎます
+        mask_np = (mask_np > 0).astype(np.float32)
 
         # 画像とマスクへ同時に同じ変換を適用
-        augmented = self.transform(image=image, mask=mask)
+        augmented = self.transform(image=image, mask=mask_np)
         image = augmented['image']
         mask = augmented['mask']
         
-        # ネットワークの出力と損失関数の次元に合わせるため [1, H, W] に変形
-        mask = mask.unsqueeze(0)
+        # 次元が [H, W] の場合、[1, H, W] に拡張
+        if len(mask.shape) == 2:
+            mask = mask.unsqueeze(0)
 
         return image, mask
