@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 import timm
 
 # ==========================================
-# 1. 提案手法専用のカスタム損失関数（Deep Supervision対応版）
+# 1. 損失関数 (Deep Supervision対応)
 # ==========================================
 class HybridLoss(nn.Module):
     def __init__(self, lambda_sparse=0.1, lambda_dice=1.0, lambda_deep_sup=0.3):
@@ -13,276 +12,155 @@ class HybridLoss(nn.Module):
         self.bce = nn.BCEWithLogitsLoss()
         self.lambda_sparse = lambda_sparse
         self.lambda_dice = lambda_dice
-        self.lambda_deep_sup = lambda_deep_sup # Deep Supervisionの重み
+        self.lambda_deep_sup = lambda_deep_sup
 
     def forward(self, pred_mask, true_mask, gate_values, deep_sup_masks=None):
-        # 1. 最終出力に対するセグメンテーション損失（BCE + Dice）
         l_seg_final = self.calc_seg_loss(pred_mask, true_mask)
-        
-        # 2. Deep Supervision：中間出力に対するセグメンテーション損失
         l_seg_deep = 0.0
         if deep_sup_masks is not None:
             for mask in deep_sup_masks:
-                # 正解マスクを中間出力のサイズにリサイズ
                 target_rescaled = F.interpolate(true_mask, size=mask.shape[2:], mode='nearest')
                 l_seg_deep += self.calc_seg_loss(mask, target_rescaled)
-            l_seg_deep /= len(deep_sup_masks) # 平均をとる
+            l_seg_deep /= len(deep_sup_masks)
 
-        # セグメンテーション全体の損失（最終出力 + 中間出力）
         l_seg = l_seg_final + (self.lambda_deep_sup * l_seg_deep)
-        
-        # 3. スパース性ペナルティ
         l_sparse = torch.mean(gate_values)
-        
-        # 総合損失
-        total_loss = l_seg + (self.lambda_sparse * l_sparse)
-        
-        return total_loss, l_seg, l_sparse
+        return l_seg + (self.lambda_sparse * l_sparse), l_seg, l_sparse
 
     def calc_seg_loss(self, pred, target):
-        # BCE Loss
         l_bce = self.bce(pred, target)
-        
-        # Dice Loss
-        pred_sigmoid = torch.sigmoid(pred)
-        intersection = (pred_sigmoid * target).sum(dim=(2, 3))
-        union = pred_sigmoid.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
-        dice_score = (2. * intersection + 1e-5) / (union + 1e-5)
-        l_dice = 1.0 - dice_score.mean()
-        
-        return l_bce + self.lambda_dice * l_dice
+        pred_sig = torch.sigmoid(pred)
+        inter = (pred_sig * target).sum(dim=(2, 3))
+        uni = pred_sig.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+        dice = 1.0 - (2. * inter + 1e-5) / (uni + 1e-5)
+        return l_bce + self.lambda_dice * dice.mean()
 
 # ==========================================
-# 2. Deformable Attention モジュール
+# 2. Coordinate Attention (v4 高速化の要)
 # ==========================================
-class SimpleDeformableAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads=4, num_points=8):
+class CoordinateAttention(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.num_points = num_points
-        self.head_dim = embed_dim // num_heads
-
-        self.offset_proj = nn.Linear(embed_dim, num_heads * num_points * 2)
-        self.weight_proj = nn.Linear(embed_dim, num_heads * num_points)
-        self.value_proj = nn.Linear(embed_dim, embed_dim)
-        self.output_proj = nn.Linear(embed_dim, embed_dim)
-
-    def forward(self, x, h, w):
-        B, N, C = x.shape
-
-        # 参照ポイントの生成
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(0, 1, h, device=x.device),
-            torch.linspace(0, 1, w, device=x.device),
-            indexing='ij'
-        )
-        ref_points = torch.stack([grid_x, grid_y], dim=-1).reshape(N, 2)
-        ref_points = ref_points.unsqueeze(0).unsqueeze(2).unsqueeze(3)
-
-        # オフセットと重みの予測
-        offsets = self.offset_proj(x).reshape(B, N, self.num_heads, self.num_points, 2)
-        weights = self.weight_proj(x).reshape(B, N, self.num_heads, self.num_points)
-        weights = F.softmax(weights, dim=-1)
-
-        # サンプリング座標の計算
-        sample_coords = ref_points + offsets
-        sample_coords = sample_coords * 2.0 - 1.0 # normalize to [-1, 1] for grid_sample
-
-        # Valueのプロジェクトと変形
-        v = self.value_proj(x)
-        v_spatial = rearrange(v, 'b (h w) c -> b c h w', h=h, w=w)
-        v_spatial = v_spatial.reshape(B * self.num_heads, self.head_dim, h, w)
-        
-        # サンプリング座標の変形
-        sample_coords_grouped = sample_coords.permute(0, 2, 1, 3, 4).reshape(B * self.num_heads, N, self.num_points, 2)
-
-        # 特徴量のサンプリング（Deformable Sampling）
-        sampled_v = F.grid_sample(v_spatial, sample_coords_grouped, mode='bilinear', align_corners=False)
-        sampled_v = sampled_v.reshape(B, self.num_heads, self.head_dim, N, self.num_points)
-
-        # 重み付き和の計算
-        weights = weights.permute(0, 2, 1, 3).unsqueeze(2)
-        weighted_v = torch.sum(sampled_v * weights, dim=-1)
-
-        # 出力の変換
-        out = rearrange(weighted_v, 'b head d n -> b n (head d)')
-        out = self.output_proj(out)
-
-        return out
-
-# ==========================================
-# 3. デコーダ用モジュール (Attention Gated U-Net)
-# ==========================================
-class DepthwiseSeparableConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels, bias=False)
-        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(8, inp // reduction)
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.ReLU(inplace=True)
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        x = self.bn(x)
-        return self.relu(x)
+        identity = x
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.act(self.bn1(self.conv1(y)))
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = torch.sigmoid(self.conv_h(x_h))
+        a_w = torch.sigmoid(self.conv_w(x_w))
+        return identity * a_w * a_h
 
-# 修正済み：解像度不一致を解消したAttention Gate
+# ==========================================
+# 3. デコーダ構成部品
+# ==========================================
 class AttentionGate(nn.Module):
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
-        self.W_g = nn.Sequential(
-            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(F_int)
-        )
-        self.W_x = nn.Sequential(
-            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(F_int)
-        )
-        self.psi = nn.Sequential(
-            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
-            nn.BatchNorm2d(1),
-            nn.Sigmoid()
-        )
+        self.W_g = nn.Sequential(nn.Conv2d(F_g, F_int, 1), nn.BatchNorm2d(F_int))
+        self.W_x = nn.Sequential(nn.Conv2d(F_l, F_int, 1), nn.BatchNorm2d(F_int))
+        self.psi = nn.Sequential(nn.Conv2d(F_int, 1, 1), nn.BatchNorm2d(1), nn.Sigmoid())
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, g, x):
-        g1 = self.W_g(g)
-        x1 = self.W_x(x)
-        
-        # g1の解像度をx1の解像度に合わせる
-        if g1.shape[2:] != x1.shape[2:]:
-            g1 = F.interpolate(g1, size=x1.shape[2:], mode='bilinear', align_corners=False)
-            
-        psi = self.relu(g1 + x1)
-        psi = self.psi(psi)
+        if g.shape[2:] != x.shape[2:]:
+            g = F.interpolate(g, size=x.shape[2:], mode='bilinear', align_corners=False)
+        psi = self.psi(self.relu(self.W_g(g) + self.W_x(x)))
         return x * psi
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, attention=False):
+    def __init__(self, in_ch, skip_ch, out_ch, use_ag=False):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.attention = attention
-        
-        if attention:
-            self.ag = AttentionGate(F_g=in_channels, F_l=skip_channels, F_int=skip_channels // 2)
-        
-        self.conv = DepthwiseSeparableConv(in_channels + skip_channels, out_channels)
+        self.ag = AttentionGate(in_ch, skip_ch, skip_ch // 2) if use_ag else None
+        # Depthwise Separable Conv でさらに軽量化
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch + skip_ch, in_ch + skip_ch, 3, padding=1, groups=in_ch + skip_ch, bias=False),
+            nn.Conv2d(in_ch + skip_ch, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)
+        )
 
     def forward(self, x, skip=None):
-        # 1. アップサンプリング
-        x_up = self.up(x)
-        
-        # 2. スキップ接続の結合
+        x = self.up(x)
         if skip is not None:
-            if x_up.shape[2:] != skip.shape[2:]:
-                x_up = F.interpolate(x_up, size=skip.shape[2:], mode='bilinear', align_corners=False)
-            
-            # Attention Gateでフィルタリング
-            if self.attention:
-                skip = self.ag(g=x, x=skip) # xはアップサンプリング前の特徴量
-            
-            x_up = torch.cat([x_up, skip], dim=1)
-        
-        # 3. 畳み込み
-        return self.conv(x_up)
+            if self.ag: skip = self.ag(g=x, x=skip)
+            x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
 
-class AttentionGatedUNetDecoder(nn.Module):
-    def __init__(self, encoder_channels, decoder_channels=[256, 128, 64, 32, 16], high_res_skip_ch=32):
+class HighSpeedDecoder(nn.Module):
+    def __init__(self, enc_chs, high_res_ch=32):
         super().__init__()
-        self.b4 = DecoderBlock(encoder_channels[4], encoder_channels[3], decoder_channels[0], attention=True)
-        self.b3 = DecoderBlock(decoder_channels[0], encoder_channels[2], decoder_channels[1], attention=True)
-        self.b2 = DecoderBlock(decoder_channels[1], encoder_channels[1], decoder_channels[2], attention=True)
-        self.b1 = DecoderBlock(decoder_channels[2], encoder_channels[0], decoder_channels[3], attention=True)
+        self.b4 = DecoderBlock(enc_chs[4], enc_chs[3], 256, use_ag=True)
+        self.b3 = DecoderBlock(256, enc_chs[2], 128, use_ag=True)
+        self.b2 = DecoderBlock(128, enc_chs[1], 64, use_ag=True)
+        self.b1 = DecoderBlock(64, enc_chs[0], 32, use_ag=True)
         
-        # 修正：high_res_skip_ch の受け入れ先を up1 から up3 に移動
-        self.up1 = DecoderBlock(decoder_channels[3], 0, decoder_channels[4], attention=False)
-        self.up2 = DecoderBlock(decoder_channels[4], 0, 16, attention=False)
-        self.up3 = DecoderBlock(16, high_res_skip_ch, 16, attention=False)
+        # 32x32 -> 256x256 へ戻すための3段階アップサンプリング
+        self.up1 = DecoderBlock(32, 0, 16, use_ag=False) # 32x32 -> 64x64
+        self.up2 = DecoderBlock(16, 0, 16, use_ag=False) # 64x64 -> 128x128
+        self.up3 = DecoderBlock(16, high_res_ch, 16, use_ag=False) # 128x128 -> 256x256
         
-        self.final_conv = nn.Conv2d(16, 1, kernel_size=1)
+        self.final_conv = nn.Conv2d(16, 1, 1)
         
-        # Deep Supervision用のサブ予測器
-        self.deep_sup3 = nn.Conv2d(decoder_channels[1], 1, kernel_size=1) # 1/4スケール
-        self.deep_sup2 = nn.Conv2d(decoder_channels[2], 1, kernel_size=1) # 1/2スケール
-        self.deep_sup1 = nn.Conv2d(decoder_channels[3], 1, kernel_size=1) # 等倍スケール
+        # Deep Supervision用
+        self.ds3 = nn.Conv2d(128, 1, 1)
+        self.ds2 = nn.Conv2d(64, 1, 1)
 
-    def forward(self, features, high_res_skip=None):
+    def forward(self, features, high_res_skip):
         f0, f1, f2, f3, f4 = features
         x = self.b4(f4, f3)
-        x = self.b3(x, f2)
-        ds3_out = self.deep_sup3(x)
+        x = self.b3(x, f2); ds3 = self.ds3(x)
+        x = self.b2(x, f1); ds2 = self.ds2(x)
+        x = self.b1(x, f0)  # ここで解像度は 32x32
         
-        x = self.b2(x, f1)
-        ds2_out = self.deep_sup2(x)
-        
-        x = self.b1(x, f0)
-        ds1_out = self.deep_sup1(x)
-        
-        # 修正：high_res_skip の結合先を up3 に移動
+        # up1, up2, up3 を順番に通過させる
         x = self.up1(x)
         x = self.up2(x)
         x = self.up3(x, high_res_skip)
-        out = self.final_conv(x)
         
-        return out, [ds3_out, ds2_out, ds1_out]
+        return self.final_conv(x), [ds3, ds2]
 
 # ==========================================
-# 統合モデル (Proposed Hybrid Segmentation Net)
+# 4. Hybrid Net v4 (Proposed High-Speed)
 # ==========================================
 class HybridSegmentationNet(nn.Module):
-    def __init__(self, in_channels=3, embed_dim=64, num_heads=4, alpha=0.1, high_res_skip_ch=32):
+    def __init__(self, alpha=0.1):
         super().__init__()
         self.alpha = alpha
-        
         self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, embed_dim // 2, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(embed_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(embed_dim // 2, embed_dim, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(embed_dim)
+            nn.Conv2d(3, 32, 3, 2, 1, bias=False), nn.BatchNorm2d(32), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, 2, 1, bias=False), nn.BatchNorm2d(64)
         )
+        self.high_res_proj = nn.Conv2d(3, 32, 1)
+        self.attn = CoordinateAttention(64, 64) # 高速なCoordAttへ変更
+        self.score_proj = nn.Conv2d(64, 1, 1)
         
-        # High-Resolution Skip用の特徴抽出Conv
-        self.high_res_proj = nn.Conv2d(in_channels, high_res_skip_ch, kernel_size=1)
-        
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = SimpleDeformableAttention(embed_dim, num_heads=num_heads, num_points=8)
-        self.score_proj = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, 1)
-        )
-
-        self.encoder = timm.create_model(
-            'mobilenetv3_large_100', 
-            pretrained=True, 
-            in_chans=embed_dim, 
-            features_only=True
-        )
-        
-        self.decoder = AttentionGatedUNetDecoder(encoder_channels=[16, 24, 40, 112, 960], high_res_skip_ch=high_res_skip_ch)
+        self.encoder = timm.create_model('mobilenetv3_large_100', pretrained=True, features_only=True, in_chans=64)
+        self.decoder = HighSpeedDecoder(enc_chs=[16, 24, 40, 112, 960])
 
     def forward(self, x):
-        # High-Resolution Skip用の特徴量を保持
-        high_res_skip = self.high_res_proj(x)
-        
+        hr_skip = self.high_res_proj(x)
         x_stem = self.stem(x)
-        h = w = x_stem.shape[2]
         
-        x_seq = rearrange(x_stem, 'b c h w -> b (h w) c')
-        x_norm = self.norm1(x_seq)
+        z_attn = self.attn(x_stem)
         
-        attn_out = self.attn(x_norm, h, w)
-        z_attn = x_seq + attn_out
-        
-        raw_score = self.score_proj(z_attn)
-        gate = self.alpha + (1.0 - self.alpha) * torch.sigmoid(raw_score)
+        # Soft Gate (Attentionマップの生成)
+        gate = self.alpha + (1.0 - self.alpha) * torch.sigmoid(self.score_proj(z_attn))
         x_masked = z_attn * gate
         
-        x_restored = rearrange(x_masked, 'b (h w) c -> b c h w', h=h, w=w)
+        enc_feats = self.encoder(x_masked)
+        out, ds_list = self.decoder(enc_feats, hr_skip)
         
-        encoder_features = self.encoder(x_restored)
-        out_mask, deep_sup_masks = self.decoder(encoder_features, high_res_skip)
-        
-        return out_mask, gate, deep_sup_masks
+        return out, gate, ds_list
