@@ -1,93 +1,116 @@
 import os
+import csv
 import argparse
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-import csv
-
-# 自作モジュールのインポート
-from model import HybridSegmentationNet, HybridLoss
 from dataset import SegmentationDataset
+from model import HybridSegmentationNet, HybridLoss
 
-def calculate_iou(pred, target):
-    """IoU (Intersection over Union) の計算"""
+# ==========================================
+# 評価指標の計算関数
+# ==========================================
+def calc_iou(pred, target):
     pred = (torch.sigmoid(pred) > 0.5).float()
     intersection = (pred * target).sum()
     union = pred.sum() + target.sum() - intersection
-    if union == 0:
-        return 1.0
-    return (intersection / union).item()
+    return (intersection / (union + 1e-5)).item()
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device):
-    model.train()
-    total_loss, total_iou = 0, 0
-    for images, masks in tqdm(dataloader, desc="  Train", leave=False):
-        images, masks = images.to(device), masks.to(device)
-        optimizer.zero_grad()
-        pred_mask, gate_values = model(images)
-        loss, _, _ = criterion(pred_mask, masks, gate_values)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        total_iou += calculate_iou(pred_mask, masks)
-    return total_loss / len(dataloader), total_iou / len(dataloader)
-
-def validate(model, dataloader, criterion, device):
-    model.eval()
-    total_loss, total_iou = 0, 0
-    with torch.no_grad():
-        for images, masks in tqdm(dataloader, desc="  Val  ", leave=False):
-            images, masks = images.to(device), masks.to(device)
-            pred_mask, gate_values = model(images)
-            loss, _, _ = criterion(pred_mask, masks, gate_values)
-            total_loss += loss.item()
-            total_iou += calculate_iou(pred_mask, masks)
-    return total_loss / len(dataloader), total_iou / len(dataloader)
-
+# ==========================================
+# メイン学習ループ
+# ==========================================
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(args.save_dir, exist_ok=True)
+    print(f"Using device: {device}")
+    
+    # 保存先ディレクトリの作成 (weights/ がない場合は作成)
+    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+    
+    # 1. データセットとデータローダーの準備
+    train_img_dir = os.path.join(args.data_root, "train/images")
+    train_mask_dir = os.path.join(args.data_root, "train/masks")
+    val_img_dir = os.path.join(args.data_root, "val/images")
+    val_mask_dir = os.path.join(args.data_root, "val/masks")
 
-    train_ds = SegmentationDataset(os.path.join(args.data_root, "train/images"), os.path.join(args.data_root, "train/masks"))
-    val_ds = SegmentationDataset(os.path.join(args.data_root, "val/images"), os.path.join(args.data_root, "val/masks"))
+    train_ds = SegmentationDataset(train_img_dir, train_mask_dir, is_train=True)
+    val_ds = SegmentationDataset(val_img_dir, val_mask_dir, is_train=False)
+    
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
 
-    model = HybridSegmentationNet(alpha=args.alpha).to(device)
-    criterion = HybridLoss(lambda_sparse=args.lambda_sparse)
+    # 2. モデル、損失関数、オプティマイザの初期化
+    model = HybridSegmentationNet().to(device)
+    criterion = HybridLoss() 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
-    # ログファイルの準備
-    log_path = os.path.join(args.save_dir, "learning_log.csv")
-    with open(log_path, 'w', newline='') as f:
+    best_iou = 0.0
+
+    # CSVログファイルの初期化（ヘッダーの書き込み）
+    with open(args.log_path, mode='w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'train_iou', 'val_loss', 'val_iou'])
+        writer.writerow(['Epoch', 'Train_Loss', 'Train_IoU', 'Val_Loss', 'Val_IoU'])
 
-    best_val_loss = float('inf')
-
+    # 3. エポックループ
     for epoch in range(args.epochs):
-        t_loss, t_iou = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        v_loss, v_iou = validate(model, val_loader, criterion, device)
         
+        # --- Train Phase ---
+        model.train()
+        train_loss, train_iou = 0.0, 0.0
+        
+        for images, masks in train_loader:
+            images, masks = images.to(device), masks.to(device)
+            optimizer.zero_grad()
+            
+            preds, gate, deep_sup_masks = model(images)
+            loss, l_seg, l_sparse = criterion(preds, masks, gate, deep_sup_masks)
+            
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            train_iou += calc_iou(preds, masks) 
+
+        # --- Validation Phase ---
+        model.eval()
+        val_loss, val_iou = 0.0, 0.0
+        
+        with torch.no_grad():
+            for images, masks in val_loader:
+                images, masks = images.to(device), masks.to(device)
+                
+                preds, gate, deep_sup_masks = model(images)
+                loss, l_seg, l_sparse = criterion(preds, masks, gate, deep_sup_masks)
+                
+                val_loss += loss.item()
+                val_iou += calc_iou(preds, masks)
+
+        # --- エポック結果の計算と出力 ---
+        t_loss = train_loss / len(train_loader)
+        t_iou = train_iou / len(train_loader)
+        v_loss = val_loss / len(val_loader)
+        v_iou = val_iou / len(val_loader)
+
         print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {t_loss:.4f}, IoU: {t_iou:.4f} | Val Loss: {v_loss:.4f}, IoU: {v_iou:.4f}")
 
-        # ログの書き込み
-        with open(log_path, 'a', newline='') as f:
+        # CSVログファイルへの追記
+        with open(args.log_path, mode='a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([epoch + 1, t_loss, t_iou, v_loss, v_iou])
 
-        if v_loss < best_val_loss:
-            best_val_loss = v_loss
-            torch.save(model.state_dict(), os.path.join(args.save_dir, "best_model.pth"))
+        # --- ベストモデルの保存 ---
+        if v_iou > best_iou:
+            best_iou = v_iou
+            torch.save(model.state_dict(), args.save_path)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, default="./dataset")
-    parser.add_argument("--save_dir", type=str, default="./weights")
+    parser.add_argument("--data_root", type=str, default="./dataset") 
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--alpha", type=float, default=0.1)
-    parser.add_argument("--lambda_sparse", type=float, default=0.1)
-    main(parser.parse_args())
+    # デフォルトの保存先を weights/ 以下に変更
+    parser.add_argument("--save_path", type=str, default="weights/hybrid_net_v3_best.pth")
+    parser.add_argument("--log_path", type=str, default="weights/log.csv") 
+    
+    args = parser.parse_args()
+    main(args)
