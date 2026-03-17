@@ -39,7 +39,11 @@ def main(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
 
     # 2. モデル、損失関数、オプティマイザの初期化
-    model = HybridSegmentationNet().to(device)
+    # 【追加】引数からフラグを受け取り、モデルに渡す
+    use_coord_attn = not args.disable_coord_attn
+    use_gate = not args.disable_gate
+    model = HybridSegmentationNet(use_coord_attn=use_coord_attn, use_gate=use_gate).to(device)
+    
     criterion = HybridLoss() 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -111,6 +115,10 @@ if __name__ == "__main__":
     # デフォルトの保存先を weights/ 以下に変更
     parser.add_argument("--save_path", type=str, default="weights/hybrid_net_v3_best.pth")
     parser.add_argument("--log_path", type=str, default="weights/log.csv") 
+    
+    # 【追加】アブレーションスタディ用のフラグ
+    parser.add_argument("--disable_coord_attn", action="store_true", help="Coordinate Attentionを無効化")
+    parser.add_argument("--disable_gate", action="store_true", help="Attention GateとSoft Gateを無効化")
     
     args = parser.parse_args()
     main(args)

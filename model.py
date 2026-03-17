@@ -100,12 +100,13 @@ class DecoderBlock(nn.Module):
         return self.conv(x)
 
 class HighSpeedDecoder(nn.Module):
-    def __init__(self, enc_chs, high_res_ch=32):
+    # 【追加】use_gateパラメータを受け取り、デコーダ内のAttentionGateを一括管理
+    def __init__(self, enc_chs, high_res_ch=32, use_gate=True):
         super().__init__()
-        self.b4 = DecoderBlock(enc_chs[4], enc_chs[3], 256, use_ag=True)
-        self.b3 = DecoderBlock(256, enc_chs[2], 128, use_ag=True)
-        self.b2 = DecoderBlock(128, enc_chs[1], 64, use_ag=True)
-        self.b1 = DecoderBlock(64, enc_chs[0], 32, use_ag=True)
+        self.b4 = DecoderBlock(enc_chs[4], enc_chs[3], 256, use_ag=use_gate)
+        self.b3 = DecoderBlock(256, enc_chs[2], 128, use_ag=use_gate)
+        self.b2 = DecoderBlock(128, enc_chs[1], 64, use_ag=use_gate)
+        self.b1 = DecoderBlock(64, enc_chs[0], 32, use_ag=use_gate)
         
         # 32x32 -> 256x256 へ戻すための3段階アップサンプリング
         self.up1 = DecoderBlock(32, 0, 16, use_ag=False) # 32x32 -> 64x64
@@ -136,9 +137,13 @@ class HighSpeedDecoder(nn.Module):
 # 4. Hybrid Net v4 (Proposed High-Speed)
 # ==========================================
 class HybridSegmentationNet(nn.Module):
-    def __init__(self, alpha=0.1):
+    # 【追加】初期化時に機能のon/offを受け取る
+    def __init__(self, alpha=0.1, use_coord_attn=True, use_gate=True):
         super().__init__()
         self.alpha = alpha
+        self.use_coord_attn = use_coord_attn
+        self.use_gate = use_gate
+        
         self.stem = nn.Sequential(
             nn.Conv2d(3, 32, 3, 2, 1, bias=False), nn.BatchNorm2d(32), nn.ReLU(inplace=True),
             nn.Conv2d(32, 64, 3, 2, 1, bias=False), nn.BatchNorm2d(64)
@@ -148,17 +153,27 @@ class HybridSegmentationNet(nn.Module):
         self.score_proj = nn.Conv2d(64, 1, 1)
         
         self.encoder = timm.create_model('mobilenetv3_large_100', pretrained=True, features_only=True, in_chans=64)
-        self.decoder = HighSpeedDecoder(enc_chs=[16, 24, 40, 112, 960])
+        # 【追加】use_gateフラグをデコーダへ渡す
+        self.decoder = HighSpeedDecoder(enc_chs=[16, 24, 40, 112, 960], use_gate=self.use_gate)
 
     def forward(self, x):
         hr_skip = self.high_res_proj(x)
         x_stem = self.stem(x)
         
-        z_attn = self.attn(x_stem)
+        # 【追加】Coordinate Attention の ON/OFF
+        if self.use_coord_attn:
+            z_attn = self.attn(x_stem)
+        else:
+            z_attn = x_stem
         
-        # Soft Gate (Attentionマップの生成)
-        gate = self.alpha + (1.0 - self.alpha) * torch.sigmoid(self.score_proj(z_attn))
-        x_masked = z_attn * gate
+        # 【追加】Soft Gate の ON/OFF
+        if self.use_gate:
+            gate = self.alpha + (1.0 - self.alpha) * torch.sigmoid(self.score_proj(z_attn))
+            x_masked = z_attn * gate
+        else:
+            # ゲート無効時は恒等写像として扱い、Loss計算エラーを防ぐために1.0のダミーテンソルを生成
+            gate = torch.ones(z_attn.shape[0], 1, z_attn.shape[2], z_attn.shape[3], device=z_attn.device)
+            x_masked = z_attn
         
         enc_feats = self.encoder(x_masked)
         out, ds_list = self.decoder(enc_feats, hr_skip)
