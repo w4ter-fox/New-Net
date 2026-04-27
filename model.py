@@ -185,10 +185,8 @@ class HybridSegmentationNet(nn.Module):
         x_f3 = self.encoder.blocks[3](f2)
         f3 = self.encoder.blocks[4](x_f3)      # (B, 112, H/16, W/16) -> Skip 4
         
-        x_f4 = self.encoder.blocks[5](f3)
-        x_f4 = self.encoder.conv_head(x_f4)
-        x_f4 = self.encoder.norm_head(x_f4)    # ※ Colabのtimm仕様に合わせ、bn2からnorm_headに変更
-        f4 = self.encoder.act2(x_f4)           # (B, 960, H/32, W/32) -> Skip 5
+        x_f4 = self.encoder.blocks[5](f3)      # 出力チャンネル: 160
+        f4 = self.encoder.blocks[6](x_f4)      # 出力チャンネル: 960 (B, 960, H/32, W/32) -> Skip 5
         
         # ---------------------------------------------------------
         # 【Decoder】: 空間の復元
