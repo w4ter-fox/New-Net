@@ -26,7 +26,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         images, masks = images.to(device), masks.to(device)
         optimizer.zero_grad()
         pred_mask, gate_values = model(images)
-        loss, _, _ = criterion(pred_mask, masks, gate_values)
+        loss, l_bce, l_dice, l_sparse = criterion(pred_mask, masks, gate_values)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
