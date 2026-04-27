@@ -40,7 +40,7 @@ def validate(model, dataloader, criterion, device):
         for images, masks in tqdm(dataloader, desc="  Val  ", leave=False):
             images, masks = images.to(device), masks.to(device)
             pred_mask, gate_values = model(images)
-            loss, _, _ = criterion(pred_mask, masks, gate_values)
+            loss, l_bce, l_dice, l_sparse = criterion(pred_mask, masks, gate_values)
             total_loss += loss.item()
             total_iou += calculate_iou(pred_mask, masks)
     return total_loss / len(dataloader), total_iou / len(dataloader)
