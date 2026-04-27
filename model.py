@@ -106,10 +106,9 @@ class LightweightUNetDecoder(nn.Module):
         self.b2 = DecoderBlock(decoder_channels[1], encoder_channels[1], decoder_channels[2])
         self.b1 = DecoderBlock(decoder_channels[2], encoder_channels[0], decoder_channels[3])
         
-        self.up1 = DecoderBlock(decoder_channels[3], 0, decoder_channels[4])
-        self.up2 = DecoderBlock(decoder_channels[4], 0, 16)
-        self.up3 = DecoderBlock(16, 0, 16)
-        
+        # --- 修正箇所：過剰なアップサンプリングを削除し、サイズを調整 ---
+        # f0の時点で1/2サイズなので、あと1回アップサンプリングすれば等倍(256px)に戻ります。
+        self.final_up = DecoderBlock(decoder_channels[3], 0, 16) 
         self.final_conv = nn.Conv2d(16, 1, kernel_size=1)
 
     def forward(self, features):
@@ -117,10 +116,10 @@ class LightweightUNetDecoder(nn.Module):
         x = self.b4(f4, f3)
         x = self.b3(x, f2)
         x = self.b2(x, f1)
-        x = self.b1(x, f0)
-        x = self.up1(x)
-        x = self.up2(x)
-        x = self.up3(x)
+        x = self.b1(x, f0) # ここで 1/2 解像度
+        
+        x = self.final_up(x) # ここで 1/1 (等倍) 解像度
+        
         out = self.final_conv(x)
         return out
 
