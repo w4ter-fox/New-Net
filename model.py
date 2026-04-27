@@ -155,7 +155,7 @@ class HybridSegmentationNet(nn.Module):
         # ---------------------------------------------------------
         x = self.encoder.conv_stem(x)
         x = self.encoder.bn1(x)
-        x = self.encoder.act1(x)
+        # ※ Colabのtimm仕様に合わせ、ここで self.encoder.act1(x) は呼び出さない
         
         f0 = self.encoder.blocks[0](x)   # (B, 16, H/2, W/2) -> Skip 1
         f1 = self.encoder.blocks[1](f0)  # (B, 24, H/4, W/4) -> Attentionへ
@@ -187,7 +187,7 @@ class HybridSegmentationNet(nn.Module):
         
         x_f4 = self.encoder.blocks[5](f3)
         x_f4 = self.encoder.conv_head(x_f4)
-        x_f4 = self.encoder.bn2(x_f4)
+        x_f4 = self.encoder.norm_head(x_f4)    # ※ Colabのtimm仕様に合わせ、bn2からnorm_headに変更
         f4 = self.encoder.act2(x_f4)           # (B, 960, H/32, W/32) -> Skip 5
         
         # ---------------------------------------------------------
