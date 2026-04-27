@@ -1,71 +1,49 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 import timm
 
 # ==========================================
-# 1. Deformable Attention モジュール
+# 1. Coordinate Attention モジュール
 # ==========================================
-class SimpleDeformableAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads=4, num_points=8):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.num_points = num_points
-        self.head_dim = embed_dim // num_heads
+class CoordinateAttention(nn.Module):
+    def __init__(self, in_channels, reduction=4):
+        super(CoordinateAttention, self).__init__()
+        # 水平・垂直方向の適応型平均プーリング
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
 
-        # オフセット予測: 各クエリに対して、num_heads * num_points 個の2次元オフセット(Δx, Δy)を予測
-        self.offset_proj = nn.Linear(embed_dim, num_heads * num_points * 2)
+        mip = max(8, in_channels // reduction)
+
+        self.conv1 = nn.Conv2d(in_channels, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
         
-        # アテンション重み予測: サンプリングポイントに対する重要度を予測
-        self.weight_proj = nn.Linear(embed_dim, num_heads * num_points)
+        self.conv_h = nn.Conv2d(mip, in_channels, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, in_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        n, c, h, w = x.size()
         
-        # Valueの線形変換と最終出力の線形変換
-        self.value_proj = nn.Linear(embed_dim, embed_dim)
-        self.output_proj = nn.Linear(embed_dim, embed_dim)
-
-    def forward(self, x, h, w):
-        B, N, C = x.shape
-
-        # 1. 基準点 (Reference Points) の生成: [0, 1] の範囲で正規化
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(0, 1, h, device=x.device),
-            torch.linspace(0, 1, w, device=x.device),
-            indexing='ij'
-        )
-        ref_points = torch.stack([grid_x, grid_y], dim=-1).reshape(N, 2)
-        ref_points = ref_points.unsqueeze(0).unsqueeze(2).unsqueeze(3) # (1, N, 1, 1, 2)
-
-        # 2. オフセットとアテンション重みの計算
-        offsets = self.offset_proj(x).reshape(B, N, self.num_heads, self.num_points, 2)
-        weights = self.weight_proj(x).reshape(B, N, self.num_heads, self.num_points)
-        weights = F.softmax(weights, dim=-1) # サンプリングポイント間で正規化
-
-        # サンプリング座標 = 基準点 + オフセット (grid_sampleの仕様に合わせて[-1, 1]にスケール変換)
-        sample_coords = ref_points + offsets
-        sample_coords = sample_coords * 2.0 - 1.0 
-
-        # 3. Valueの空間サンプリング
-        v = self.value_proj(x)
-        v_spatial = rearrange(v, 'b (h w) c -> b c h w', h=h, w=w)
+        # 方向情報の集約
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
         
-        v_spatial = v_spatial.reshape(B * self.num_heads, self.head_dim, h, w)
-        sample_coords_grouped = sample_coords.permute(0, 2, 1, 3, 4).reshape(B * self.num_heads, N, self.num_points, 2)
-
-        # F.grid_sampleによる微分可能なバイリニア補間サンプリング
-        sampled_v = F.grid_sample(v_spatial, sample_coords_grouped, mode='bilinear', align_corners=False)
-        sampled_v = sampled_v.reshape(B, self.num_heads, self.head_dim, N, self.num_points)
-
-        # 4. アテンション重みによる集約
-        weights = weights.permute(0, 2, 1, 3).unsqueeze(2)
-        weighted_v = torch.sum(sampled_v * weights, dim=-1)
-
-        # 元の系列テンソルに復元
-        out = rearrange(weighted_v, 'b head d n -> b n (head d)')
-        out = self.output_proj(out)
-
-        return out
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y) 
+        
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        
+        # 水平方向と垂直方向のアテンションマップを生成
+        a_h = torch.sigmoid(self.conv_h(x_h))
+        a_w = torch.sigmoid(self.conv_w(x_w))
+        
+        # 最終的なゲート値を計算 (B, C, H, W)
+        gate = a_h * a_w
+        return gate
 
 # ==========================================
 # 2. 軽量デコーダ用モジュール (U-Net Decoder)
@@ -106,8 +84,7 @@ class LightweightUNetDecoder(nn.Module):
         self.b2 = DecoderBlock(decoder_channels[1], encoder_channels[1], decoder_channels[2])
         self.b1 = DecoderBlock(decoder_channels[2], encoder_channels[0], decoder_channels[3])
         
-        # --- 修正箇所：過剰なアップサンプリングを削除し、サイズを調整 ---
-        # f0の時点で1/2サイズなので、あと1回アップサンプリングすれば等倍(256px)に戻ります。
+        # 出力解像度を入力と一致させる(256px)ための最終アップサンプリング
         self.final_up = DecoderBlock(decoder_channels[3], 0, 16) 
         self.final_conv = nn.Conv2d(16, 1, kernel_size=1)
 
@@ -116,80 +93,57 @@ class LightweightUNetDecoder(nn.Module):
         x = self.b4(f4, f3)
         x = self.b3(x, f2)
         x = self.b2(x, f1)
-        x = self.b1(x, f0) # ここで 1/2 解像度
+        x = self.b1(x, f0)
         
-        x = self.final_up(x) # ここで 1/1 (等倍) 解像度
-        
+        x = self.final_up(x) 
         out = self.final_conv(x)
         return out
 
 # ==========================================
-# 3. 統合モデル (New-Net v5.1)
+# 3. 統合モデル
 # ==========================================
 class HybridSegmentationNet(nn.Module):
-    def __init__(self, num_heads=4, alpha=0.1):
+    def __init__(self, alpha=0.1):
         super().__init__()
         self.alpha = alpha
         
-        # ImageNetで事前学習済みの標準MobileNetV3を読み込む (pretrained=True)
+        # ImageNetで事前学習済みの標準MobileNetV3を読み込む
         self.encoder = timm.create_model('mobilenetv3_large_100', pretrained=True)
         
-        # MobileNetV3_largeの blocks[1] の出力チャンネル数は「24」
+        # MobileNetV3_largeの blocks[1] の出力チャンネル数は24
         self.embed_dim = 24 
-        self.norm1 = nn.LayerNorm(self.embed_dim)
         
-        # 24チャンネルを受け取るアテンション (24は4の倍数なのでnum_heads=4で割り切れる)
-        self.attn = SimpleDeformableAttention(self.embed_dim, num_heads=num_heads, num_points=8)
-        self.score_proj = nn.Sequential(
-            nn.LayerNorm(self.embed_dim),
-            nn.Linear(self.embed_dim, 1)
-        )
+        # Coordinate Attentionへの置き換え
+        self.attn = CoordinateAttention(in_channels=self.embed_dim)
 
-        # デコーダの初期化 (MobileNetV3の各ブロックの出力次元に厳密に一致させる)
+        # デコーダの初期化
         self.decoder = LightweightUNetDecoder(encoder_channels=[16, 24, 40, 112, 960])
 
     def forward(self, x):
-        # ---------------------------------------------------------
-        # 【Stem】: ImageNetの重みで高品質な初期特徴を抽出
-        # ---------------------------------------------------------
+        # 【Stem】
         x = self.encoder.conv_stem(x)
         x = self.encoder.bn1(x)
-        # ※ Colabのtimm仕様に合わせ、ここで self.encoder.act1(x) は呼び出さない
         
         f0 = self.encoder.blocks[0](x)   # (B, 16, H/2, W/2) -> Skip 1
         f1 = self.encoder.blocks[1](f0)  # (B, 24, H/4, W/4) -> Attentionへ
         
-        # ---------------------------------------------------------
-        # 【Attention】: Deformable Attention + α-スケーリング
-        # ---------------------------------------------------------
-        h, w = f1.shape[2:]
-        f1_seq = rearrange(f1, 'b c h w -> b (h w) c')
-        f1_norm = self.norm1(f1_seq)
+        # 【Attention】: Coordinate Attention + α-スケーリング
+        raw_gate = self.attn(f1)
+        gate = self.alpha + (1.0 - self.alpha) * raw_gate
         
-        attn_out = self.attn(f1_norm, h, w)
-        z_attn = f1_seq + attn_out
+        # 空間情報を保ったまま要素ごとの積（Masking）
+        f1_masked = f1 * gate            # (B, 24, H/4, W/4) -> Skip 2
         
-        # α-スケーリングを用いた Leaky Gate の計算
-        raw_score = self.score_proj(z_attn)
-        gate = self.alpha + (1.0 - self.alpha) * torch.sigmoid(raw_score)
-        
-        f1_masked_seq = z_attn * gate
-        f1_masked = rearrange(f1_masked_seq, 'b (h w) c -> b c h w', h=h, w=w) # Skip 2
-        
-        # ---------------------------------------------------------
-        # 【Backbone】: ノイズを遮断した綺麗な特徴を深い層へ
-        # ---------------------------------------------------------
+        # 【Backbone】
         f2 = self.encoder.blocks[2](f1_masked) # (B, 40, H/8, W/8) -> Skip 3
         
         x_f3 = self.encoder.blocks[3](f2)
         f3 = self.encoder.blocks[4](x_f3)      # (B, 112, H/16, W/16) -> Skip 4
         
-        x_f4 = self.encoder.blocks[5](f3)      # 出力チャンネル: 160
-        f4 = self.encoder.blocks[6](x_f4)      # 出力チャンネル: 960 (B, 960, H/32, W/32) -> Skip 5
+        x_f4 = self.encoder.blocks[5](f3)      # (160 channels)
+        f4 = self.encoder.blocks[6](x_f4)      # (B, 960, H/32, W/32) -> Skip 5
         
-        # ---------------------------------------------------------
-        # 【Decoder】: 空間の復元
-        # ---------------------------------------------------------
+        # 【Decoder】
         out_mask = self.decoder([f0, f1_masked, f2, f3, f4])
         
         return out_mask, gate
@@ -208,13 +162,13 @@ class HybridLoss(nn.Module):
         # BCE Loss
         l_bce = self.bce(pred_mask, true_mask)
         
-        # Dice Loss (対象物の形状一致を強烈に促す)
+        # Dice Loss
         pred_prob = torch.sigmoid(pred_mask)
         intersection = torch.sum(pred_prob * true_mask)
         union = torch.sum(pred_prob) + torch.sum(true_mask)
         l_dice = 1.0 - (2.0 * intersection + 1e-5) / (union + 1e-5)
         
-        # Sparse Loss (ゲートを閉じて背景ノイズを削る圧力)
+        # Sparse Loss (Coordinate Attentionのゲート値全体の平均を利用)
         l_sparse = torch.mean(gate_values)
         
         # 総合 Loss
