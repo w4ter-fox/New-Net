@@ -5,7 +5,7 @@ from einops import rearrange
 import timm
 
 # ==========================================
-# Deformable Attention モジュール
+# 1. Deformable Attention モジュール
 # ==========================================
 class SimpleDeformableAttention(nn.Module):
     def __init__(self, embed_dim, num_heads=4, num_points=8):
@@ -38,7 +38,6 @@ class SimpleDeformableAttention(nn.Module):
         ref_points = ref_points.unsqueeze(0).unsqueeze(2).unsqueeze(3) # (1, N, 1, 1, 2)
 
         # 2. オフセットとアテンション重みの計算
-        # view の代わりに reshape を使用してメモリ配置エラーを回避
         offsets = self.offset_proj(x).reshape(B, N, self.num_heads, self.num_points, 2)
         weights = self.weight_proj(x).reshape(B, N, self.num_heads, self.num_points)
         weights = F.softmax(weights, dim=-1) # サンプリングポイント間で正規化
@@ -51,16 +50,11 @@ class SimpleDeformableAttention(nn.Module):
         v = self.value_proj(x)
         v_spatial = rearrange(v, 'b (h w) c -> b c h w', h=h, w=w)
         
-        # reshape を使用して安全に次元変換 (B * num_heads, head_dim, h, w)
         v_spatial = v_spatial.reshape(B * self.num_heads, self.head_dim, h, w)
-        
-        # 座標テンソルもヘッドごとに分割
         sample_coords_grouped = sample_coords.permute(0, 2, 1, 3, 4).reshape(B * self.num_heads, N, self.num_points, 2)
 
         # F.grid_sampleによる微分可能なバイリニア補間サンプリング
         sampled_v = F.grid_sample(v_spatial, sample_coords_grouped, mode='bilinear', align_corners=False)
-        
-        # 元の次元構造に復元
         sampled_v = sampled_v.reshape(B, self.num_heads, self.head_dim, N, self.num_points)
 
         # 4. アテンション重みによる集約
@@ -74,7 +68,7 @@ class SimpleDeformableAttention(nn.Module):
         return out
 
 # ==========================================
-# デコーダ用モジュール (Lightweight U-Net)
+# 2. 軽量デコーダ用モジュール (U-Net Decoder)
 # ==========================================
 class DepthwiseSeparableConv(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -105,7 +99,7 @@ class DecoderBlock(nn.Module):
         return self.conv(x)
 
 class LightweightUNetDecoder(nn.Module):
-    def __init__(self, encoder_channels, decoder_channels=[256, 128, 64, 32, 16]):
+    def __init__(self, encoder_channels=[16, 24, 40, 112, 960], decoder_channels=[256, 128, 64, 32, 16]):
         super().__init__()
         self.b4 = DecoderBlock(encoder_channels[4], encoder_channels[3], decoder_channels[0])
         self.b3 = DecoderBlock(decoder_channels[0], encoder_channels[2], decoder_channels[1])
@@ -131,69 +125,102 @@ class LightweightUNetDecoder(nn.Module):
         return out
 
 # ==========================================
-# 統合モデル (Proposed Hybrid Segmentation Net)
+# 3. 統合モデル (New-Net v5.1)
 # ==========================================
 class HybridSegmentationNet(nn.Module):
-    def __init__(self, in_channels=3, embed_dim=64, num_heads=4, alpha=0.1):
+    def __init__(self, num_heads=4, alpha=0.1):
         super().__init__()
         self.alpha = alpha
         
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, embed_dim // 2, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(embed_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(embed_dim // 2, embed_dim, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(embed_dim)
-        )
+        # ImageNetで事前学習済みの標準MobileNetV3を読み込む (pretrained=True)
+        self.encoder = timm.create_model('mobilenetv3_large_100', pretrained=True)
         
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = SimpleDeformableAttention(embed_dim, num_heads=num_heads, num_points=8)
+        # MobileNetV3_largeの blocks[1] の出力チャンネル数は「24」
+        self.embed_dim = 24 
+        self.norm1 = nn.LayerNorm(self.embed_dim)
+        
+        # 24チャンネルを受け取るアテンション (24は4の倍数なのでnum_heads=4で割り切れる)
+        self.attn = SimpleDeformableAttention(self.embed_dim, num_heads=num_heads, num_points=8)
         self.score_proj = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, 1)
+            nn.LayerNorm(self.embed_dim),
+            nn.Linear(self.embed_dim, 1)
         )
 
-        self.encoder = timm.create_model(
-            'mobilenetv3_large_100', 
-            pretrained=False, 
-            in_chans=embed_dim, 
-            features_only=True
-        )
-        
+        # デコーダの初期化 (MobileNetV3の各ブロックの出力次元に厳密に一致させる)
         self.decoder = LightweightUNetDecoder(encoder_channels=[16, 24, 40, 112, 960])
 
     def forward(self, x):
-        x_stem = self.stem(x)
-        h = w = x_stem.shape[2]
+        # ---------------------------------------------------------
+        # 【Stem】: ImageNetの重みで高品質な初期特徴を抽出
+        # ---------------------------------------------------------
+        x = self.encoder.conv_stem(x)
+        x = self.encoder.bn1(x)
+        x = self.encoder.act1(x)
         
-        x_seq = rearrange(x_stem, 'b c h w -> b (h w) c')
-        x_norm = self.norm1(x_seq)
+        f0 = self.encoder.blocks[0](x)   # (B, 16, H/2, W/2) -> Skip 1
+        f1 = self.encoder.blocks[1](f0)  # (B, 24, H/4, W/4) -> Attentionへ
         
-        attn_out = self.attn(x_norm, h, w)
-        z_attn = x_seq + attn_out
+        # ---------------------------------------------------------
+        # 【Attention】: Deformable Attention + α-スケーリング
+        # ---------------------------------------------------------
+        h, w = f1.shape[2:]
+        f1_seq = rearrange(f1, 'b c h w -> b (h w) c')
+        f1_norm = self.norm1(f1_seq)
         
+        attn_out = self.attn(f1_norm, h, w)
+        z_attn = f1_seq + attn_out
+        
+        # α-スケーリングを用いた Leaky Gate の計算
         raw_score = self.score_proj(z_attn)
         gate = self.alpha + (1.0 - self.alpha) * torch.sigmoid(raw_score)
-        x_masked = z_attn * gate
         
-        x_restored = rearrange(x_masked, 'b (h w) c -> b c h w', h=h, w=w)
+        f1_masked_seq = z_attn * gate
+        f1_masked = rearrange(f1_masked_seq, 'b (h w) c -> b c h w', h=h, w=w) # Skip 2
         
-        encoder_features = self.encoder(x_restored)
-        out_mask = self.decoder(encoder_features)
+        # ---------------------------------------------------------
+        # 【Backbone】: ノイズを遮断した綺麗な特徴を深い層へ
+        # ---------------------------------------------------------
+        f2 = self.encoder.blocks[2](f1_masked) # (B, 40, H/8, W/8) -> Skip 3
+        
+        x_f3 = self.encoder.blocks[3](f2)
+        f3 = self.encoder.blocks[4](x_f3)      # (B, 112, H/16, W/16) -> Skip 4
+        
+        x_f4 = self.encoder.blocks[5](f3)
+        x_f4 = self.encoder.conv_head(x_f4)
+        x_f4 = self.encoder.bn2(x_f4)
+        f4 = self.encoder.act2(x_f4)           # (B, 960, H/32, W/32) -> Skip 5
+        
+        # ---------------------------------------------------------
+        # 【Decoder】: 空間の復元
+        # ---------------------------------------------------------
+        out_mask = self.decoder([f0, f1_masked, f2, f3, f4])
         
         return out_mask, gate
 
 # ==========================================
-# 提案手法専用のカスタム損失関数
+# 4. 提案手法専用 カスタム損失関数
 # ==========================================
 class HybridLoss(nn.Module):
-    def __init__(self, lambda_sparse=0.1):
+    def __init__(self, lambda_sparse=0.1, lambda_dice=2.0):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss()
         self.lambda_sparse = lambda_sparse
+        self.lambda_dice = lambda_dice
 
     def forward(self, pred_mask, true_mask, gate_values):
-        l_seg = self.bce(pred_mask, true_mask)
+        # BCE Loss
+        l_bce = self.bce(pred_mask, true_mask)
+        
+        # Dice Loss (対象物の形状一致を強烈に促す)
+        pred_prob = torch.sigmoid(pred_mask)
+        intersection = torch.sum(pred_prob * true_mask)
+        union = torch.sum(pred_prob) + torch.sum(true_mask)
+        l_dice = 1.0 - (2.0 * intersection + 1e-5) / (union + 1e-5)
+        
+        # Sparse Loss (ゲートを閉じて背景ノイズを削る圧力)
         l_sparse = torch.mean(gate_values)
-        total_loss = l_seg + (self.lambda_sparse * l_sparse)
-        return total_loss, l_seg, l_sparse
+        
+        # 総合 Loss
+        total_loss = l_bce + (self.lambda_dice * l_dice) + (self.lambda_sparse * l_sparse)
+        
+        return total_loss, l_bce, l_dice, l_sparse
